@@ -63,7 +63,11 @@ def get_arguments():
                         help='Base learning rate, effective learning after warmup is [base-lr] * [batch-size] / 256')
     parser.add_argument("--wd", type=float, default=1e-6,
                         help='Weight decay')
-
+    parser.add_argument("--grad-norm", type=float, default=1.0,
+                        help='Gradient Norm for clipping')
+    parser.add_argument("--grad-accum-steps", type=int, default=1,
+                        help='Number of gradient accumulation steps')
+    
     # Loss
     parser.add_argument("--sim-coeff", type=float, default=25.0,
                         help='Invariance regularization loss coefficient')
@@ -182,8 +186,13 @@ def main(args):
             
             loss = loss_dict['loss']        
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            
+            if (step + 1) % args.grad_accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_norm)
+                
+                scaler.step(optimizer)
+                scaler.update()
             
             n_iter = step + epoch * dataset_len
             # if (n_iter + 1) % args.log_freq_time == 0 :

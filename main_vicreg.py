@@ -17,9 +17,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 import torch.distributed as dist
-import torchvision.datasets as datasets
+# import torchvision.datasets as datasets
+import datasets
+import transformers
 
-import augmentations as aug
+# import augmentations as aug
 from distributed import init_distributed_mode
 
 import resnet
@@ -29,9 +31,13 @@ def get_arguments():
     parser = argparse.ArgumentParser(description="Pretrain a resnet model with VICReg", add_help=False)
 
     # Data
-    parser.add_argument("--data-dir", type=Path, default="/path/to/imagenet", required=True,
-                        help='Path to the image net dataset')
-
+    # parser.add_argument("--data-dir", type=Path, default="/path/to/imagenet", required=True,
+    #                     help='Path to the image net dataset')
+    parser.add_argument("--corpus", type=str, default="simcse", choices=['wikipedia','bookcorpus','simcse', 'test'],
+                        help='Corpus to use for training. Default : wikipedia')
+    parser.add_argument("--seq_len", type=int, default=128,
+                        help='Sequence length for Transformer model')
+        
     # Checkpoints
     parser.add_argument("--exp-dir", type=Path, default="./exp",
                         help='Path to the experiment folder, where all logs/checkpoints will be stored')
@@ -39,7 +45,7 @@ def get_arguments():
                         help='Print logs to the stats.txt file every [log-freq-time] seconds')
 
     # Model
-    parser.add_argument("--arch", type=str, default="resnet50",
+    parser.add_argument("--arch", type=str, default="bert-base-uncased",
                         help='Architecture of the backbone encoder network')
     parser.add_argument("--mlp", default="8192-8192-8192",
                         help='Size and number of layers of the MLP expander head')
@@ -47,7 +53,7 @@ def get_arguments():
     # Optim
     parser.add_argument("--epochs", type=int, default=100,
                         help='Number of epochs')
-    parser.add_argument("--batch-size", type=int, default=2048,
+    parser.add_argument("--batch-size", type=int, default=16,
                         help='Effective batch size (per worker batch size is [batch-size] / world-size)')
     parser.add_argument("--base-lr", type=float, default=0.2,
                         help='Base learning rate, effective learning after warmup is [base-lr] * [batch-size] / 256')
@@ -63,7 +69,7 @@ def get_arguments():
                         help='Covariance regularization loss coefficient')
 
     # Running
-    parser.add_argument("--num-workers", type=int, default=10)
+    parser.add_argument("--num_workers", type=int, default=10)
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
 
@@ -76,6 +82,12 @@ def get_arguments():
 
     return parser
 
+def to_cuda(batch,gpu):
+    
+    for k,v in batch.items():
+        batch[k] = v.cuda(gpu, non_blocking=True)
+    
+    return batch
 
 def main(args):
     torch.backends.cudnn.benchmark = True
@@ -89,9 +101,25 @@ def main(args):
         print(" ".join(sys.argv))
         print(" ".join(sys.argv), file=stats_file)
 
-    transforms = aug.TrainTransform()
+    # transforms = aug.TrainTransform()
 
-    dataset = datasets.ImageFolder(args.data_dir / "train", transforms)
+    # dataset = datasets.ImageFolder(args.data_dir / "train", transforms)
+    if args.corpus=='bookcorpus':
+        corpus = datasets.load_dataset(args.corpus,split='train')
+    elif args.corpus=='wikipedia':
+        corpus = datasets.load_dataset(args.corpus,name='20200501.en',split='train')
+    elif args.corpus=='simcse':
+        corpus = datasets.load_dataset('text', data_files='wiki1m_for_simcse.txt',split='train')
+    elif args.corpus=='test':
+        corpus = datasets.load_dataset('text', data_files='wiki1m_for_simcse.txt',split='train')
+        corpus = corpus.select(range(1000))
+        args.num_workers = 2
+                
+    tokenizer = transformers.BertTokenizer.from_pretrained('bert-base-uncased')
+    dataset = corpus.map(lambda e: tokenizer(e['text'],truncation=True,padding='max_length',max_length=args.seq_len),
+                         remove_columns='text',num_proc=args.num_workers)
+    dataset.set_format('torch')
+    
     sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
     assert args.batch_size % args.world_size == 0
     per_device_batch_size = args.batch_size // args.world_size
@@ -128,15 +156,17 @@ def main(args):
     scaler = torch.cuda.amp.GradScaler()
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
-        for step, ((x, y), _) in enumerate(loader, start=epoch * len(loader)):
-            x = x.cuda(gpu, non_blocking=True)
-            y = y.cuda(gpu, non_blocking=True)
+        for step, batch in enumerate(loader, start=epoch * len(loader)):
+            # x = x.cuda(gpu, non_blocking=True)
+            # y = y.cuda(gpu, non_blocking=True)
+            batch = to_cuda(batch,gpu)
 
             lr = adjust_learning_rate(args, optimizer, loader, step)
 
             optimizer.zero_grad()
             with torch.cuda.amp.autocast():
-                loss = model.forward(x, y)
+                loss = model(batch)
+                
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -186,14 +216,17 @@ class VICReg(nn.Module):
         super().__init__()
         self.args = args
         self.num_features = int(args.mlp.split("-")[-1])
-        self.backbone, self.embedding = resnet.__dict__[args.arch](
-            zero_init_residual=True
-        )
+        # self.backbone, self.embedding = resnet.__dict__[args.arch](
+        #     zero_init_residual=True
+        # )
+        self.backbone = transformers.AutoModel.from_pretrained(args.arch)
+        self.backbone.train()
+        self.embedding = self.backbone.config.hidden_size
         self.projector = Projector(args, self.embedding)
 
-    def forward(self, x, y):
-        x = self.projector(self.backbone(x))
-        y = self.projector(self.backbone(y))
+    def forward(self, batch):
+        x = self.projector(self.backbone(**batch).pooler_output)
+        y = self.projector(self.backbone(**batch).pooler_output)
 
         repr_loss = F.mse_loss(x, y)
 

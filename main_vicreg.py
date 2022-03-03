@@ -12,20 +12,20 @@ import math
 import os
 import sys
 import time
-
+from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
 import torch.distributed as dist
 # import torchvision.datasets as datasets
 import datasets
-import transformers
 
 # import augmentations as aug
 from distributed import init_distributed_mode
-
-import resnet
-
+from torch.utils.tensorboard import SummaryWriter
+# import resnet
+import transformers
+transformers.logging.set_verbosity_error()
 
 def get_arguments():
     parser = argparse.ArgumentParser(description="Pretrain a resnet model with VICReg", add_help=False)
@@ -39,10 +39,12 @@ def get_arguments():
                         help='Sequence length for Transformer model')
         
     # Checkpoints
-    parser.add_argument("--exp-dir", type=Path, default="./exp",
+    parser.add_argument("--exp-dir", type=Path, default="/mounts/data/proj/jabbar/vicreg",
                         help='Path to the experiment folder, where all logs/checkpoints will be stored')
     parser.add_argument("--log-freq-time", type=int, default=60,
                         help='Print logs to the stats.txt file every [log-freq-time] seconds')
+    parser.add_argument("--resume-from-checkpoint", action='store_true', 
+                        help='Resumes from last checkpoint')
 
     # Model
     parser.add_argument("--arch", type=str, default="bert-base-uncased",
@@ -51,9 +53,11 @@ def get_arguments():
                         help='Size and number of layers of the MLP expander head')
 
     # Optim
-    parser.add_argument("--epochs", type=int, default=100,
+    parser.add_argument("--epochs", type=int, default=10,
                         help='Number of epochs')
-    parser.add_argument("--batch-size", type=int, default=16,
+    parser.add_argument("--warmup-epochs", type=int, default=2,
+                        help='Number of warmup epochs for LR scheduler')
+    parser.add_argument("--batch-size", type=int, default=64,
                         help='Effective batch size (per worker batch size is [batch-size] / world-size)')
     parser.add_argument("--base-lr", type=float, default=0.2,
                         help='Base learning rate, effective learning after warmup is [base-lr] * [batch-size] / 256')
@@ -69,6 +73,8 @@ def get_arguments():
                         help='Covariance regularization loss coefficient')
 
     # Running
+    parser.add_argument("--exp-name", type=str, required=True,
+                        help='Name of Exp to be passed to log dir')
     parser.add_argument("--num_workers", type=int, default=10)
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -90,6 +96,8 @@ def to_cuda(batch,gpu):
     return batch
 
 def main(args):
+    writer = SummaryWriter(args.exp_dir/'tb_logs'/args.exp_name)
+    args.exp_dir = args.exp_dir/args.exp_name
     torch.backends.cudnn.benchmark = True
     init_distributed_mode(args)
     print(args)
@@ -123,6 +131,7 @@ def main(args):
     sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
     assert args.batch_size % args.world_size == 0
     per_device_batch_size = args.batch_size // args.world_size
+    
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=per_device_batch_size,
@@ -130,6 +139,7 @@ def main(args):
         pin_memory=True,
         sampler=sampler,
     )
+    dataset_len = len(loader)
 
     model = VICReg(args).cuda(gpu)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -142,9 +152,9 @@ def main(args):
         lars_adaptation_filter=exclude_bias_and_norm,
     )
 
-    if (args.exp_dir / "model.pth").is_file():
+    if (args.exp_dir / "model.pth").is_file() and args.resume_from_checkpoint:
         if args.rank == 0:
-            print("resuming from checkpoint")
+            print(f"resuming from checkpoint : {str(args.exp_dir/'model.pth')}")
         ckpt = torch.load(args.exp_dir / "model.pth", map_location="cpu")
         start_epoch = ckpt["epoch"]
         model.load_state_dict(ckpt["model"])
@@ -156,20 +166,32 @@ def main(args):
     scaler = torch.cuda.amp.GradScaler()
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
-        for step, batch in enumerate(loader, start=epoch * len(loader)):
+        for step, batch in enumerate(tqdm(loader,total=dataset_len), start=epoch * dataset_len):
             # x = x.cuda(gpu, non_blocking=True)
             # y = y.cuda(gpu, non_blocking=True)
             batch = to_cuda(batch,gpu)
 
-            lr = adjust_learning_rate(args, optimizer, loader, step)
+            lr = adjust_learning_rate(args, optimizer, dataset_len, step)
 
             optimizer.zero_grad()
             with torch.cuda.amp.autocast():
-                loss = model(batch)
-                
+                loss_dict = model(batch)
+            
+            for k,v in loss_dict.items():
+                loss_dict[k] = scaler.scale(v)
+            
+            loss = loss_dict['loss']        
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            
+            n_iter = step + epoch * dataset_len
+            # if (n_iter + 1) % args.log_freq_time == 0 :
+            #     writer.add_scalar('loss', loss.item(), n_iter)
+            #     writer.add_scalar('repr_loss', loss_dict['repr_loss'].item(), n_iter)
+            #     writer.add_scalar('cov_loss', loss_dict['cov_loss'].item(), n_iter)
+            #     writer.add_scalar('std_loss', loss_dict['std_loss'].item(), n_iter)
+            #     writer.add_scalar('lr', lr, n_iter)
 
             current_time = time.time()
             if args.rank == 0 and current_time - last_logging > args.log_freq_time:
@@ -180,7 +202,12 @@ def main(args):
                     time=int(current_time - start_time),
                     lr=lr,
                 )
-                print(json.dumps(stats))
+                writer.add_scalar('Loss/total', loss.item(), n_iter)
+                writer.add_scalar('Loss/repr', loss_dict['repr_loss'].item(), n_iter)
+                writer.add_scalar('Loss/cov', loss_dict['cov_loss'].item(), n_iter)
+                writer.add_scalar('Loss/std', loss_dict['std_loss'].item(), n_iter)
+                writer.add_scalar('lr', lr, n_iter)                
+                # print(json.dumps(stats))
                 print(json.dumps(stats), file=stats_file)
                 last_logging = current_time
         if args.rank == 0:
@@ -191,12 +218,12 @@ def main(args):
             )
             torch.save(state, args.exp_dir / "model.pth")
     if args.rank == 0:
-        torch.save(model.module.backbone.state_dict(), args.exp_dir / "resnet50.pth")
+        torch.save(model.module.backbone.state_dict(), args.exp_dir / f"{args.arch}.pth")
 
 
-def adjust_learning_rate(args, optimizer, loader, step):
-    max_steps = args.epochs * len(loader)
-    warmup_steps = 10 * len(loader)
+def adjust_learning_rate(args, optimizer, dataset_len, step):
+    max_steps = args.epochs * dataset_len
+    warmup_steps = args.warmup_epochs * dataset_len
     base_lr = args.base_lr * args.batch_size / 256
     if step < warmup_steps:
         lr = base_lr * step / warmup_steps
@@ -250,7 +277,10 @@ class VICReg(nn.Module):
             + self.args.std_coeff * std_loss
             + self.args.cov_coeff * cov_loss
         )
-        return loss
+        return {'loss':loss,
+                'repr_loss':repr_loss,
+                'std_loss':std_loss,
+                'cov_loss':cov_loss}
 
 
 def Projector(args, embedding):

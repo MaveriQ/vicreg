@@ -55,11 +55,11 @@ def get_arguments():
     # Optim
     parser.add_argument("--epochs", type=int, default=10,
                         help='Number of epochs')
-    parser.add_argument("--warmup-epochs", type=int, default=2,
+    parser.add_argument("--warmup-epochs", type=float, default=1.0,
                         help='Number of warmup epochs for LR scheduler')
     parser.add_argument("--batch-size", type=int, default=64,
                         help='Effective batch size (per worker batch size is [batch-size] / world-size)')
-    parser.add_argument("--base-lr", type=float, default=0.2,
+    parser.add_argument("--base-lr", type=float, default=1e-3,
                         help='Base learning rate, effective learning after warmup is [base-lr] * [batch-size] / 256')
     parser.add_argument("--wd", type=float, default=1e-6,
                         help='Weight decay')
@@ -75,7 +75,9 @@ def get_arguments():
                         help='Variance regularization loss coefficient')
     parser.add_argument("--cov-coeff", type=float, default=1.0,
                         help='Covariance regularization loss coefficient')
-
+    parser.add_argument("--use-param-weights", action='store_true', 
+                        help='Use learnable weights for the three losses')
+    
     # Running
     parser.add_argument("--exp-name", type=str, required=True,
                         help='Name of Exp to be passed to log dir')
@@ -86,7 +88,7 @@ def get_arguments():
     # Distributed
     parser.add_argument('--world-size', default=1, type=int,
                         help='number of distributed processes')
-    parser.add_argument('--local_rank', default=-1, type=int)
+    # parser.add_argument('--local_rank', default=-1, type=int)
     parser.add_argument('--dist-url', default='env://',
                         help='url used to set up distributed training')
 
@@ -196,11 +198,6 @@ def main(args):
             
             n_iter = step + epoch * dataset_len
             # if (n_iter + 1) % args.log_freq_time == 0 :
-            #     writer.add_scalar('loss', loss.item(), n_iter)
-            #     writer.add_scalar('repr_loss', loss_dict['repr_loss'].item(), n_iter)
-            #     writer.add_scalar('cov_loss', loss_dict['cov_loss'].item(), n_iter)
-            #     writer.add_scalar('std_loss', loss_dict['std_loss'].item(), n_iter)
-            #     writer.add_scalar('lr', lr, n_iter)
 
             current_time = time.time()
             if args.rank == 0 and current_time - last_logging > args.log_freq_time:
@@ -225,7 +222,7 @@ def main(args):
                 model=model.state_dict(),
                 optimizer=optimizer.state_dict(),
             )
-            torch.save(state, args.exp_dir / "model.pth")
+            torch.save(state, args.exp_dir / f"ckpt_epoch_{epoch+1}.pth")
     if args.rank == 0:
         torch.save(model.module.backbone.state_dict(), args.exp_dir / f"{args.arch}.pth")
 
@@ -259,6 +256,11 @@ class VICReg(nn.Module):
         self.backbone.train()
         self.embedding = self.backbone.config.hidden_size
         self.projector = Projector(args, self.embedding)
+        if self.args.use_param_weights:
+            self.param = nn.ParameterDict({'sim_coeff':nn.Parameter(torch.rand(1) + self.args.sim_coeff),
+                                           'std_coeff':nn.Parameter(torch.rand(1) + self.args.std_coeff),
+                                           'cov_coeff':nn.Parameter(torch.rand(1) + self.args.cov_coeff),
+                                           })
 
     def forward(self, batch):
         x = self.projector(self.backbone(**batch).pooler_output)
@@ -281,11 +283,18 @@ class VICReg(nn.Module):
             self.num_features
         ) + off_diagonal(cov_y).pow_(2).sum().div(self.num_features)
 
-        loss = (
+        if self.args.use_param_weights:
+            loss = (
+            self.param.sim_coeff * repr_loss
+            + self.param.std_coeff * std_loss
+            + self.param.cov_coeff * cov_loss                
+            )
+        else:
+            loss = (
             self.args.sim_coeff * repr_loss
             + self.args.std_coeff * std_loss
             + self.args.cov_coeff * cov_loss
-        )
+            )
         return {'loss':loss,
                 'repr_loss':repr_loss,
                 'std_loss':std_loss,

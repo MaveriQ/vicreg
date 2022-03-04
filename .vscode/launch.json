@@ -15,7 +15,9 @@
                 "--nproc_per_node", "2", 
                 "main_vicreg.py",
                 "--corpus", "test",
-                "--exp-name", "debug"
+                "--exp-name", "debug",
+                "--use-param-weights",
+                "--use-alternate-lr"
                 // "--data_path", "/dataset/imagenet/train",
             ]
         }

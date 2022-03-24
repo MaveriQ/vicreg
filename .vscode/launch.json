@@ -5,17 +5,28 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Current File",
+            "name": "Python: Evaluation",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python: Training",
             "type": "python",
             "request": "launch",
             "module": "torch.distributed.launch",
             // "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "--nproc_per_node", "2", 
+                "--nproc_per_node",
+                "2",
                 "main_vicreg.py",
-                "--corpus", "test",
-                "--exp-name", "debug",
+                "--corpus",
+                "test",
+                "--exp-name",
+                "debug",
                 "--use-param-weights",
                 "--use-alternate-lr"
                 // "--data_path", "/dataset/imagenet/train",

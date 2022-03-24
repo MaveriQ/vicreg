@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
+from multiprocessing import set_forkserver_preload
 from pathlib import Path
 import argparse
 import json
@@ -36,6 +37,8 @@ def get_arguments():
                         help='Corpus to use for training. Default : wikipedia')
     parser.add_argument("--seq_len", type=int, default=128,
                         help='Sequence length for Transformer model')
+    parser.add_argument("--use-processed-data", action='store_true', 
+                        help='Loads preprocessed bookcorpus')
         
     # Checkpoints
     parser.add_argument("--exp-dir", type=Path, default="/mounts/data/proj/jabbar/vicreg",
@@ -44,7 +47,9 @@ def get_arguments():
                         help='Print logs to the stats.txt file every [log-freq-time] seconds')
     parser.add_argument("--resume-from-checkpoint", action='store_true', 
                         help='Resumes from last checkpoint')
-
+    parser.add_argument("--ckpt_fraction", type=float, default=0.1,
+                        help='Fraction of epoch to save checkpoint at.')
+    
     # Model
     parser.add_argument("--arch", type=str, default="bert-base-uncased",
                         help='Architecture of the backbone encoder network')
@@ -109,20 +114,24 @@ def main(args):
         print(" ".join(sys.argv))
         print(" ".join(sys.argv), file=stats_file)
 
-    if args.corpus=='bookcorpus':
-        corpus = datasets.load_dataset(args.corpus,split='train')
-    elif args.corpus=='wikipedia':
-        corpus = datasets.load_dataset(args.corpus,name='20200501.en',split='train')
-    elif args.corpus=='simcse':
-        corpus = datasets.load_dataset('text', data_files='wiki1m_for_simcse.txt',split='train')
-    elif args.corpus=='test':
-        corpus = datasets.load_dataset('text', data_files='wiki1m_for_simcse.txt',split='train')
-        corpus = corpus.select(range(1000))
-        args.num_workers = 2
-                
-    tokenizer = transformers.BertTokenizer.from_pretrained('bert-base-uncased')
-    dataset = corpus.map(lambda e: tokenizer(e['text'],truncation=True,padding='max_length',max_length=args.seq_len),
-                         remove_columns='text',num_proc=args.num_workers)
+    if args.use_processed_data:
+        print('\nLoading preprocessed data... \n')
+        dataset = datasets.load_from_disk('/mounts/data/proj/jabbar/bookcorpus_seq128')
+    else:
+        if args.corpus=='bookcorpus':
+            corpus = datasets.load_dataset(args.corpus,split='train')
+        elif args.corpus=='wikipedia':
+            corpus = datasets.load_dataset(args.corpus,name='20200501.en',split='train')
+        elif args.corpus=='simcse':
+            corpus = datasets.load_dataset('text', data_files='wiki1m_for_simcse.txt',split='train')
+        elif args.corpus=='test':
+            corpus = datasets.load_dataset('text', data_files='wiki1m_for_simcse.txt',split='train')
+            corpus = corpus.select(range(1000))
+            args.num_workers = 2
+                    
+        tokenizer = transformers.BertTokenizer.from_pretrained('bert-base-uncased')
+        dataset = corpus.map(lambda e: tokenizer(e['text'],truncation=True,padding='max_length',max_length=args.seq_len), batched=True,
+                            remove_columns='text',num_proc=args.num_workers)
     dataset.set_format('torch')
     
     sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
@@ -198,7 +207,7 @@ def main(args):
                 scaler.step(optimizer)
                 scaler.update()
             
-            n_iter = step + epoch * dataset_len
+            n_iter = step + epoch * dataset_len + 1
             # if (n_iter + 1) % args.log_freq_time == 0 :
 
             current_time = time.time()
@@ -219,20 +228,23 @@ def main(args):
                     writer.add_scalar('Loss/repr', loss_dict['repr_loss'].item(), n_iter)
                     writer.add_scalar('Loss/cov', loss_dict['cov_loss'].item(), n_iter)
                     writer.add_scalar('Loss/std', loss_dict['std_loss'].item(), n_iter)
-                    writer.add_scalars('Parameters',model.module.param, n_iter)                
-                    writer.add_scalar('lr', lr, n_iter)                
+                    writer.add_scalar('lr', lr, n_iter)
+                    if args.use_param_weights:
+                        writer.add_scalars('Parameters',model.module.param, n_iter)                         
                     
                     print(json.dumps(stats), file=stats_file)
                     last_logging = current_time
-        if args.rank == 0:
-            state = dict(
-                epoch=epoch + 1,
-                model=model.state_dict(),
-                optimizer=optimizer.state_dict(),
-            )
-            torch.save(state, args.exp_dir / f"ckpt_epoch_{epoch+1}.pth")
+                    
+                if n_iter % int(args.ckpt_fraction * args.epochs * dataset_len) == 0:
+                    state = dict(
+                        epoch=epoch + 1,
+                        model=model.state_dict(),
+                        optimizer=optimizer.state_dict(),
+                    )
+                    torch.save(state, args.exp_dir / f"ckpt_step_{n_iter}.pth")
     if args.rank == 0:
-        torch.save(model.module.backbone.state_dict(), args.exp_dir / f"{args.arch}.pth")
+        # torch.save(model.module.backbone.state_dict(), args.exp_dir / f"{args.arch}.pth")
+        torch.save(state, args.exp_dir / f"ckpt_final.pth")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser('VICReg training script', parents=[get_arguments()])
